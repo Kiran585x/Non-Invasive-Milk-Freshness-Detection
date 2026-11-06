@@ -1,0 +1,167 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Protocentral_FDC1004.h>
+#define SDA_PIN 5
+#define SCL_PIN 6
+#define GREEN_LED 3
+#define RED_LED 8
+const char* ssid="Sai Galaxy";
+const char* password="11111111";
+WebServer server(80);
+FDC1004 capacitanceSensor(FDC1004_RATE_100HZ);
+const unsigned long BLINK_INTERVAL=150;
+unsigned long lastBlink=0;
+bool ledState=false;
+
+float liveCap=0;
+const float NO_PACKET_THRESHOLD = 10;
+const float FRESH_THRESHOLD     = 70;
+const float SPOILED_THRESHOLD   = 69.9;
+// ---------- Sampling ----------
+const int TOTAL_SAMPLES = 500;               // total samples to take
+const int LAST_N = 250;                      // only average the LAST 250 of those
+const unsigned long MAX_SAMPLING_MS = 10000; // safety cap in case sensor is slow
+// -------------------------------
+unsigned long phaseStart = 0;
+bool classified = false;
+int classifySamples = 0;
+String statusText = "SAMPLING";
+// ---- Rolling buffer holding only the last LAST_N samples ----
+float lastBuffer[LAST_N];
+int lastBufIndex = 0;
+float rollingSum = 0;
+void pushSample(float cap){
+  if(classifySamples >= LAST_N){
+    rollingSum -= lastBuffer[lastBufIndex];
+  }
+  lastBuffer[lastBufIndex] = cap;
+  rollingSum += cap;
+  lastBufIndex = (lastBufIndex + 1) % LAST_N;
+}
+void blinkError(){
+  digitalWrite(GREEN_LED,HIGH);
+  digitalWrite(RED_LED,LOW);
+  delay(100);
+  digitalWrite(GREEN_LED,LOW);
+  digitalWrite(RED_LED,HIGH);
+  delay(100);
+}
+String classify(float avg){
+  if (avg < NO_PACKET_THRESHOLD) return "NO PACKET";
+  if (avg >= FRESH_THRESHOLD) return "FRESH";
+  if (avg <= SPOILED_THRESHOLD) return "SPOILED";
+  return "BORDERLINE";
+}
+void applyResultLED(const String& status){
+  if (status == "FRESH"){
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(RED_LED, LOW);
+  } else if (status == "SPOILED"){
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(RED_LED, HIGH);
+  } else {
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(RED_LED, LOW);
+  }
+}
+String statusColor(){
+  if(statusText=="FRESH") return "#2e7d32";
+  if(statusText=="SPOILED") return "#c62828";
+  if(statusText=="BORDERLINE") return "#f9a825";
+  return "#607d8b";
+}
+void handleRoot(){
+  String html="<!DOCTYPE html><html><head>";
+  html+="<meta http-equiv='refresh' content='1'>";
+  html+="<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html+="<title>Milk Freshness Monitor</title>";
+  html+="<style>";
+  html+="body{font-family:Arial,sans-serif;background:#f2f2f2;text-align:center;padding:20px;margin:0;}";
+  html+=".card{max-width:360px;margin:0 auto;background:#fff;border-radius:10px;padding:20px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}";
+  html+="h1{font-size:18px;color:#333;margin-bottom:20px;}";
+  html+=".value{font-size:14px;color:#777;margin:10px 0 2px;}";
+  html+=".number{font-size:28px;font-weight:bold;color:#222;margin:0 0 10px;}";
+  html+=".badge{display:inline-block;margin-top:10px;padding:10px 20px;border-radius:6px;color:#fff;font-size:18px;font-weight:bold;background:"+statusColor()+";}";
+  html+="</style></head><body>";
+  html+="<div class='card'>";
+  html+="<h1>Milk Freshness Monitor</h1>";
+  html+="<div class='value'>Live Capacitance</div>";
+  html+="<div class='number'>"+String(liveCap,4)+" pF</div>";
+  html+="<div class='badge'>"+statusText+"</div>";
+  html+="</div></body></html>";
+  server.send(200,"text/html",html);
+}
+void setup(){
+  Serial.begin(115200);
+  delay(2000);
+  pinMode(GREEN_LED,OUTPUT);
+  pinMode(RED_LED,OUTPUT);
+  Wire.begin(SDA_PIN,SCL_PIN);
+  Wire.setClock(100000);
+  if(!capacitanceSensor.begin()) while(1) blinkError();
+  if(!capacitanceSensor.isConnected()) while(1) blinkError();
+  WiFi.begin(ssid,password);
+  Serial.print("Connecting");
+  while(WiFi.status()!=WL_CONNECTED){
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("Connected. IP: ");
+  Serial.println(WiFi.localIP());
+  server.on("/",handleRoot);
+  server.begin();
+  Serial.println("Collecting samples...");
+  phaseStart = millis();
+}
+void loop(){
+  if(!classified){
+    if(millis()-lastBlink>=BLINK_INTERVAL){
+      lastBlink=millis();
+      ledState=!ledState;
+      digitalWrite(GREEN_LED,ledState);
+      digitalWrite(RED_LED,!ledState);
+    }
+    fdc1004_capacitance_t m=
+        capacitanceSensor.getCapacitanceMeasurement(FDC1004_CHANNEL_0);
+    if(!isnan(m.capacitance_pf)){
+      float cap=m.capacitance_pf;
+      liveCap=cap;
+      pushSample(cap);
+      classifySamples++;
+      Serial.print("Sample ");
+      Serial.print(classifySamples);
+      Serial.print(" = ");
+      Serial.print(cap,4);
+      Serial.println(" pF");
+    }
+    bool reachedTarget = classifySamples >= TOTAL_SAMPLES;
+    bool timedOut = (millis() - phaseStart) >= MAX_SAMPLING_MS;
+    if(reachedTarget || timedOut){
+      classified = true;
+      int countUsed = min(classifySamples, LAST_N);
+      float classifyAvg = (countUsed > 0) ? (rollingSum / countUsed) : NAN;
+      if (countUsed == 0 || isnan(classifyAvg)){
+        statusText = "MEASUREMENT ERROR";
+        digitalWrite(GREEN_LED, LOW);
+        digitalWrite(RED_LED, LOW);
+      } else {
+        statusText = classify(classifyAvg);
+        applyResultLED(statusText);
+      }
+      liveCap = classifyAvg;
+      Serial.print("FINAL CLASSIFICATION (last ");
+      Serial.print(countUsed);
+      Serial.print(" of ");
+      Serial.print(classifySamples);
+      Serial.print(" samples) = ");
+      Serial.print(classifyAvg,4);
+      Serial.print(" pF -> ");
+      Serial.println(statusText);
+      Serial.println("Sensor reading stopped.");
+    }
+  }
+  server.handleClient();
+  delay(20);
+}
+
