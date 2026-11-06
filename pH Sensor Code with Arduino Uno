@@ -1,0 +1,37 @@
+#define PH_PIN A0
+
+const int samples = 50;
+
+void setup() {
+  Serial.begin(9600);
+}
+
+void loop() {
+
+  long adcSum = 0;
+
+  // Average multiple readings
+  for (int i = 0; i < samples; i++) {
+    adcSum += analogRead(PH_PIN);
+    delay(10);
+  }
+
+  float adcAverage = adcSum / (float)samples;
+
+  // Convert ADC to voltage
+  float voltage = adcAverage * (5.0 / 1023.0);
+
+  // 3-point calibration equation
+  float pH = (-2.8501 * voltage * voltage)
+           + (13.1076 * voltage)
+           - 2.4560;
+
+  Serial.print("Voltage: ");
+  Serial.print(voltage, 3);
+  Serial.print(" V   ");
+
+  Serial.print("pH: ");
+  Serial.println(pH, 2);
+
+  delay(1000);
+}
